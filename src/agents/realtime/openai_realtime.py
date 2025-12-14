@@ -915,6 +915,9 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
         if "tool_choice" in model_settings:
             session_create_request.tool_choice = cast(Any, model_settings.get("tool_choice"))
 
+        if "tracing" in model_settings:
+            session_create_request.tracing = model_settings.get("tracing")
+
         return session_create_request
 
     def _tools_to_session_tools(
