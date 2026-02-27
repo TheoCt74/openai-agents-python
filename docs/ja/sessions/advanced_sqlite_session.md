@@ -4,15 +4,15 @@ search:
 ---
 # 高度な SQLite セッション
 
-`AdvancedSQLiteSession` は、会話のブランチ、詳細な使用状況分析、構造化された会話クエリなど、上級の会話管理機能を提供する `SQLiteSession` の強化版です。
+`AdvancedSQLiteSession` は基本の `SQLiteSession` を拡張したバージョンで、会話の分岐、詳細な利用状況分析、構造化された会話クエリなど、高度な会話管理機能を提供します。
 
-## 機能
+## 特長
 
-- **会話のブランチ**: 任意の ユーザー メッセージから代替の会話パスを作成
-- **使用状況トラッキング**: 1 ターンごとの詳細なトークン使用分析と完全な JSON ブレークダウン
-- **構造化クエリ**: ターンごとの会話取得、ツール使用統計など
-- **ブランチ管理**: 独立したブランチの切り替えと管理
-- **メッセージ構造メタデータ**: メッセージ種別、ツール使用、会話フローを追跡
+- **会話の分岐**: 任意の ユーザー メッセージから代替の会話パスを作成できます
+- **利用状況の追跡**: 各ターンごとの詳細なトークン利用分析を、完全な JSON 内訳とともに提供します
+- **構造化クエリ**: ターン単位の会話取得、ツール利用統計などを取得できます
+- **ブランチの管理**: 独立したブランチの切り替えと管理が可能です
+- **メッセージ構造メタデータ**: メッセージ種別、ツール使用状況、会話フローを追跡します
 
 ## クイックスタート
 
@@ -85,15 +85,15 @@ session = AdvancedSQLiteSession(
 ### パラメーター
 
 - `session_id` (str): 会話セッションの一意の識別子
-- `db_path` (str | Path): SQLite データベースファイルへのパス。メモリ内保存の場合は `:memory:` がデフォルトです
-- `create_tables` (bool): 上級テーブルを自動作成するかどうか。デフォルトは `False`
-- `logger` (logging.Logger | None): セッション用のカスタムロガー。デフォルトはモジュールのロガー
+- `db_path` (str | Path): SQLite データベースファイルへのパス。インメモリ保存には `:memory:` を既定とします
+- `create_tables` (bool): 高度なテーブルを自動作成するかどうか。既定は `False`
+- `logger` (logging.Logger | None): セッション用のカスタムロガー。既定はモジュールのロガー
 
-## 使用状況トラッキング
+## 利用状況の追跡
 
-AdvancedSQLiteSession は、会話の各ターンごとにトークン使用データを保存することで詳細な使用分析を提供します。**これは各 エージェント 実行後に `store_run_usage` メソッドが呼び出されることに完全に依存します。**
+AdvancedSQLiteSession は、会話の各ターンごとにトークン利用データを保存することで、詳細な利用状況分析を提供します。これは、各 エージェント 実行後に `store_run_usage` メソッドが呼び出されることに完全に依存します。
 
-### 使用データの保存
+### 利用状況データの保存
 
 ```python
 # After each agent run, store the usage data
@@ -107,7 +107,7 @@ await session.store_run_usage(result)
 # - Detailed JSON token information (if available)
 ```
 
-### 使用統計の取得
+### 利用統計の取得
 
 ```python
 # Get session-level usage (all branches)
@@ -135,9 +135,9 @@ for turn_data in turn_usage:
 turn_2_usage = await session.get_turn_usage(user_turn_number=2)
 ```
 
-## 会話のブランチ
+## 会話の分岐
 
-AdvancedSQLiteSession の主要機能のひとつは、任意の ユーザー メッセージから会話ブランチを作成し、代替の会話パスを探索できることです。
+AdvancedSQLiteSession の主要機能の 1 つは、任意の ユーザー メッセージから会話ブランチを作成し、代替の会話パスを探索できることです。
 
 ### ブランチの作成
 
@@ -165,7 +165,7 @@ branch_id = await session.create_branch_from_content(
 )
 ```
 
-### ブランチ管理
+### ブランチの管理
 
 ```python
 # List all branches
@@ -245,7 +245,7 @@ for turn in matching_turns:
 
 ### メッセージ構造
 
-セッションは、以下を含むメッセージ構造を自動的に追跡します。
+セッションは次のようなメッセージ構造を自動的に追跡します。
 
 - メッセージ種別（user、assistant、tool_call など）
 - ツール呼び出しのツール名
@@ -296,9 +296,9 @@ CREATE TABLE turn_usage (
 );
 ```
 
-## 完全な例
+## 完全なサンプルコード
 
-すべての機能を包括的に示す[完全な例](https://github.com/openai/openai-agents-python/tree/main/examples/memory/advanced_sqlite_session_example.py)をご覧ください。
+すべての機能を包括的に示す [完全なサンプルコード](https://github.com/openai/openai-agents-python/tree/main/examples/memory/advanced_sqlite_session_example.py) をご覧ください。
 
 
 ## API リファレンス

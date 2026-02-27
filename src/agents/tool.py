@@ -1,10 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
-from collections.abc import Awaitable
+import math
+import weakref
+from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Literal, Union, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Generic,
+    Literal,
+    Optional,
+    Protocol,
+    TypeVar,
+    Union,
+    cast,
+    overload,
+)
 
 from openai.types.responses.file_search_tool_param import Filters, RankingOptions
 from openai.types.responses.response_computer_tool_call import (
@@ -20,8 +35,8 @@ from typing_extensions import Concatenate, NotRequired, ParamSpec, TypedDict
 
 from . import _debug
 from .computer import AsyncComputer, Computer
-from .editor import ApplyPatchEditor
-from .exceptions import ModelBehaviorError
+from .editor import ApplyPatchEditor, ApplyPatchOperation
+from .exceptions import ModelBehaviorError, ToolTimeoutError, UserError
 from .function_schema import DocstringStyle, function_schema
 from .logger import logger
 from .run_context import RunContextWrapper
@@ -34,7 +49,7 @@ from .util._types import MaybeAwaitable
 
 if TYPE_CHECKING:
     from .agent import Agent, AgentBase
-    from .items import RunItem
+    from .items import RunItem, ToolApprovalItem
 
 
 ToolParams = ParamSpec("ToolParams")
@@ -48,6 +63,11 @@ ToolFunction = Union[
     ToolFunctionWithContext[ToolParams],
     ToolFunctionWithToolContext[ToolParams],
 ]
+
+DEFAULT_APPROVAL_REJECTION_MESSAGE = "Tool execution was not approved."
+ToolTimeoutBehavior = Literal["error_as_result", "raise_exception"]
+ToolErrorFunction = Callable[[RunContextWrapper[Any], Exception], MaybeAwaitable[str]]
+_SYNC_FUNCTION_TOOL_MARKER = "__agents_sync_function_tool__"
 
 
 class ToolOutputText(BaseModel):
@@ -129,6 +149,43 @@ ValidToolOutputPydanticModelsTypeAdapter: TypeAdapter[ValidToolOutputPydanticMod
     ValidToolOutputPydanticModels
 )
 
+ComputerLike = Union[Computer, AsyncComputer]
+ComputerT = TypeVar("ComputerT", bound=ComputerLike)
+ComputerT_co = TypeVar("ComputerT_co", bound=ComputerLike, covariant=True)
+ComputerT_contra = TypeVar("ComputerT_contra", bound=ComputerLike, contravariant=True)
+
+
+class ComputerCreate(Protocol[ComputerT_co]):
+    """Initializes a computer for the current run context."""
+
+    def __call__(self, *, run_context: RunContextWrapper[Any]) -> MaybeAwaitable[ComputerT_co]: ...
+
+
+class ComputerDispose(Protocol[ComputerT_contra]):
+    """Cleans up a computer initialized for a run context."""
+
+    def __call__(
+        self,
+        *,
+        run_context: RunContextWrapper[Any],
+        computer: ComputerT_contra,
+    ) -> MaybeAwaitable[None]: ...
+
+
+@dataclass
+class ComputerProvider(Generic[ComputerT]):
+    """Configures create/dispose hooks for per-run computer lifecycle management."""
+
+    create: ComputerCreate[ComputerT]
+    dispose: ComputerDispose[ComputerT] | None = None
+
+
+ComputerConfig = Union[
+    ComputerT,
+    ComputerCreate[ComputerT],
+    ComputerProvider[ComputerT],
+]
+
 
 @dataclass
 class FunctionToolResult:
@@ -138,8 +195,17 @@ class FunctionToolResult:
     output: Any
     """The output of the tool."""
 
-    run_item: RunItem
-    """The run item that was produced as a result of the tool call."""
+    run_item: RunItem | None
+    """The run item that was produced as a result of the tool call.
+
+    This can be None when the tool run is interrupted and no output item should be emitted yet.
+    """
+
+    interruptions: list[ToolApprovalItem] = field(default_factory=list)
+    """Interruptions from nested agent runs (for agent-as-tool)."""
+
+    agent_run_result: Any = None  # RunResult | None, but avoid circular import
+    """Nested agent run result (for agent-as-tool)."""
 
 
 @dataclass
@@ -179,16 +245,51 @@ class FunctionTool:
     and returns whether the tool is enabled. You can use this to dynamically enable/disable a tool
     based on your context/state."""
 
-    # Tool-specific guardrails
+    # Keep guardrail fields before needs_approval to preserve v0.7.0 positional
+    # constructor compatibility for public FunctionTool callers.
+    # Tool-specific guardrails.
     tool_input_guardrails: list[ToolInputGuardrail[Any]] | None = None
     """Optional list of input guardrails to run before invoking this tool."""
 
     tool_output_guardrails: list[ToolOutputGuardrail[Any]] | None = None
     """Optional list of output guardrails to run after invoking this tool."""
 
+    needs_approval: (
+        bool | Callable[[RunContextWrapper[Any], dict[str, Any], str], Awaitable[bool]]
+    ) = False
+    """Whether the tool needs approval before execution. If True, the run will be interrupted
+    and the tool call will need to be approved using RunState.approve() or rejected using
+    RunState.reject() before continuing. Can be a bool (always/never needs approval) or a
+    function that takes (run_context, tool_parameters, call_id) and returns whether this
+    specific call needs approval."""
+
+    # Keep timeout fields after needs_approval to preserve positional constructor compatibility.
+    timeout_seconds: float | None = None
+    """Optional timeout (seconds) for each tool invocation."""
+
+    timeout_behavior: ToolTimeoutBehavior = "error_as_result"
+    """How to handle timeout events.
+
+    - "error_as_result": return a model-visible timeout error string.
+    - "raise_exception": raise a ToolTimeoutError and fail the run.
+    """
+
+    timeout_error_function: ToolErrorFunction | None = None
+    """Optional formatter for timeout errors when timeout_behavior is "error_as_result"."""
+
+    _is_agent_tool: bool = field(default=False, init=False, repr=False)
+    """Internal flag indicating if this tool is an agent-as-tool."""
+
+    _is_codex_tool: bool = field(default=False, init=False, repr=False)
+    """Internal flag indicating if this tool is a Codex tool wrapper."""
+
+    _agent_instance: Any = field(default=None, init=False, repr=False)
+    """Internal reference to the agent instance if this is an agent-as-tool."""
+
     def __post_init__(self):
         if self.strict_json_schema:
             self.params_json_schema = ensure_strict_json_schema(self.params_json_schema)
+        _validate_function_tool_timeout_config(self)
 
 
 @dataclass
@@ -237,21 +338,121 @@ class WebSearchTool:
         return "web_search"
 
 
-@dataclass
-class ComputerTool:
+@dataclass(eq=False)
+class ComputerTool(Generic[ComputerT]):
     """A hosted tool that lets the LLM control a computer."""
 
-    computer: Computer | AsyncComputer
-    """The computer implementation, which describes the environment and dimensions of the computer,
-    as well as implements the computer actions like click, screenshot, etc.
-    """
+    computer: ComputerConfig[ComputerT]
+    """The computer implementation, or a factory that produces a computer per run."""
 
     on_safety_check: Callable[[ComputerToolSafetyCheckData], MaybeAwaitable[bool]] | None = None
     """Optional callback to acknowledge computer tool safety checks."""
 
+    def __post_init__(self) -> None:
+        _store_computer_initializer(self)
+
     @property
     def name(self):
         return "computer_use_preview"
+
+
+@dataclass
+class _ResolvedComputer:
+    computer: ComputerLike
+    dispose: ComputerDispose[ComputerLike] | None = None
+
+
+_computer_cache: weakref.WeakKeyDictionary[
+    ComputerTool[Any],
+    weakref.WeakKeyDictionary[RunContextWrapper[Any], _ResolvedComputer],
+] = weakref.WeakKeyDictionary()
+_computer_initializer_map: weakref.WeakKeyDictionary[ComputerTool[Any], ComputerConfig[Any]] = (
+    weakref.WeakKeyDictionary()
+)
+_computers_by_run_context: weakref.WeakKeyDictionary[
+    RunContextWrapper[Any], dict[ComputerTool[Any], _ResolvedComputer]
+] = weakref.WeakKeyDictionary()
+
+
+async def resolve_computer(
+    *, tool: ComputerTool[Any], run_context: RunContextWrapper[Any]
+) -> ComputerLike:
+    """Resolve a computer for a given run context, initializing it if needed."""
+    per_context = _computer_cache.get(tool)
+    if per_context is None:
+        per_context = weakref.WeakKeyDictionary()
+        _computer_cache[tool] = per_context
+
+    cached = per_context.get(run_context)
+    if cached is not None:
+        _track_resolved_computer(tool=tool, run_context=run_context, resolved=cached)
+        return cached.computer
+
+    initializer_config = _get_computer_initializer(tool)
+    lifecycle: ComputerProvider[Any] | None = (
+        cast(ComputerProvider[Any], initializer_config)
+        if _is_computer_provider(initializer_config)
+        else None
+    )
+    initializer: ComputerCreate[Any] | None = None
+    disposer: ComputerDispose[Any] | None = lifecycle.dispose if lifecycle else None
+
+    if lifecycle is not None:
+        initializer = lifecycle.create
+    elif callable(initializer_config):
+        initializer = initializer_config
+    elif _is_computer_provider(tool.computer):
+        lifecycle_provider = cast(ComputerProvider[Any], tool.computer)
+        initializer = lifecycle_provider.create
+        disposer = lifecycle_provider.dispose
+
+    if initializer:
+        computer_candidate = initializer(run_context=run_context)
+        computer = (
+            await computer_candidate
+            if inspect.isawaitable(computer_candidate)
+            else computer_candidate
+        )
+    else:
+        computer = cast(ComputerLike, tool.computer)
+
+    if not isinstance(computer, (Computer, AsyncComputer)):
+        raise UserError("The computer tool did not provide a computer instance.")
+
+    resolved = _ResolvedComputer(computer=computer, dispose=disposer)
+    per_context[run_context] = resolved
+    _track_resolved_computer(tool=tool, run_context=run_context, resolved=resolved)
+    tool.computer = computer
+    return computer
+
+
+async def dispose_resolved_computers(*, run_context: RunContextWrapper[Any]) -> None:
+    """Dispose any computer instances created for the provided run context."""
+    resolved_by_tool = _computers_by_run_context.pop(run_context, None)
+    if not resolved_by_tool:
+        return
+
+    disposers: list[tuple[ComputerDispose[ComputerLike], ComputerLike]] = []
+
+    for tool, _resolved in resolved_by_tool.items():
+        per_context = _computer_cache.get(tool)
+        if per_context is not None:
+            per_context.pop(run_context, None)
+
+        initializer = _get_computer_initializer(tool)
+        if initializer is not None:
+            tool.computer = initializer
+
+        if _resolved.dispose is not None:
+            disposers.append((_resolved.dispose, _resolved.computer))
+
+    for dispose, computer in disposers:
+        try:
+            result = dispose(run_context=run_context, computer=computer)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.warning("Failed to dispose computer for run context: %s", exc)
 
 
 @dataclass
@@ -296,6 +497,58 @@ MCPToolApprovalFunction = Callable[
     [MCPToolApprovalRequest], MaybeAwaitable[MCPToolApprovalFunctionResult]
 ]
 """A function that approves or rejects a tool call."""
+
+
+ShellApprovalFunction = Callable[
+    [RunContextWrapper[Any], "ShellActionRequest", str], MaybeAwaitable[bool]
+]
+"""A function that determines whether a shell action requires approval.
+Takes (run_context, action, call_id) and returns whether approval is needed.
+"""
+
+
+class ShellOnApprovalFunctionResult(TypedDict):
+    """The result of a shell tool on_approval callback."""
+
+    approve: bool
+    """Whether to approve the tool call."""
+
+    reason: NotRequired[str]
+    """An optional reason, if rejected."""
+
+
+ShellOnApprovalFunction = Callable[
+    [RunContextWrapper[Any], "ToolApprovalItem"], MaybeAwaitable[ShellOnApprovalFunctionResult]
+]
+"""A function that auto-approves or rejects a shell tool call when approval is needed.
+Takes (run_context, approval_item) and returns approval decision.
+"""
+
+
+ApplyPatchApprovalFunction = Callable[
+    [RunContextWrapper[Any], ApplyPatchOperation, str], MaybeAwaitable[bool]
+]
+"""A function that determines whether an apply_patch operation requires approval.
+Takes (run_context, operation, call_id) and returns whether approval is needed.
+"""
+
+
+class ApplyPatchOnApprovalFunctionResult(TypedDict):
+    """The result of an apply_patch tool on_approval callback."""
+
+    approve: bool
+    """Whether to approve the tool call."""
+
+    reason: NotRequired[str]
+    """An optional reason, if rejected."""
+
+
+ApplyPatchOnApprovalFunction = Callable[
+    [RunContextWrapper[Any], "ToolApprovalItem"], MaybeAwaitable[ApplyPatchOnApprovalFunctionResult]
+]
+"""A function that auto-approves or rejects an apply_patch tool call when approval is needed.
+Takes (run_context, approval_item) and returns approval decision.
+"""
 
 
 @dataclass
@@ -374,6 +627,106 @@ class LocalShellTool:
         return "local_shell"
 
 
+class ShellToolLocalSkill(TypedDict):
+    """Skill metadata for local shell environments."""
+
+    description: str
+    name: str
+    path: str
+
+
+class ShellToolSkillReference(TypedDict):
+    """Reference to a hosted shell skill."""
+
+    type: Literal["skill_reference"]
+    skill_id: str
+    version: NotRequired[str]
+
+
+class ShellToolInlineSkillSource(TypedDict):
+    """Inline skill source payload."""
+
+    data: str
+    media_type: Literal["application/zip"]
+    type: Literal["base64"]
+
+
+class ShellToolInlineSkill(TypedDict):
+    """Inline hosted shell skill bundle."""
+
+    description: str
+    name: str
+    source: ShellToolInlineSkillSource
+    type: Literal["inline"]
+
+
+ShellToolContainerSkill = Union[ShellToolSkillReference, ShellToolInlineSkill]
+"""Container skill configuration."""
+
+
+class ShellToolContainerNetworkPolicyDomainSecret(TypedDict):
+    """A secret bound to a single domain in allowlist mode."""
+
+    domain: str
+    name: str
+    value: str
+
+
+class ShellToolContainerNetworkPolicyAllowlist(TypedDict):
+    """Allowlist network policy for hosted containers."""
+
+    allowed_domains: list[str]
+    type: Literal["allowlist"]
+    domain_secrets: NotRequired[list[ShellToolContainerNetworkPolicyDomainSecret]]
+
+
+class ShellToolContainerNetworkPolicyDisabled(TypedDict):
+    """Disabled network policy for hosted containers."""
+
+    type: Literal["disabled"]
+
+
+ShellToolContainerNetworkPolicy = Union[
+    ShellToolContainerNetworkPolicyAllowlist,
+    ShellToolContainerNetworkPolicyDisabled,
+]
+"""Network policy configuration for hosted shell containers."""
+
+
+class ShellToolLocalEnvironment(TypedDict):
+    """Local shell execution environment."""
+
+    type: Literal["local"]
+    skills: NotRequired[list[ShellToolLocalSkill]]
+
+
+class ShellToolContainerAutoEnvironment(TypedDict):
+    """Auto-provisioned hosted container environment."""
+
+    type: Literal["container_auto"]
+    file_ids: NotRequired[list[str]]
+    memory_limit: NotRequired[Literal["1g", "4g", "16g", "64g"] | None]
+    network_policy: NotRequired[ShellToolContainerNetworkPolicy]
+    skills: NotRequired[list[ShellToolContainerSkill]]
+
+
+class ShellToolContainerReferenceEnvironment(TypedDict):
+    """Reference to an existing hosted container."""
+
+    type: Literal["container_reference"]
+    container_id: str
+
+
+ShellToolHostedEnvironment = Union[
+    ShellToolContainerAutoEnvironment,
+    ShellToolContainerReferenceEnvironment,
+]
+"""Hosted shell environment variants."""
+
+ShellToolEnvironment = Union[ShellToolLocalEnvironment, ShellToolHostedEnvironment]
+"""All supported shell environments."""
+
+
 @dataclass
 class ShellCallOutcome:
     """Describes the terminal condition of a shell command."""
@@ -382,17 +735,13 @@ class ShellCallOutcome:
     exit_code: int | None = None
 
 
-def _default_shell_outcome() -> ShellCallOutcome:
-    return ShellCallOutcome(type="exit")
-
-
 @dataclass
 class ShellCommandOutput:
     """Structured output for a single shell command execution."""
 
     stdout: str = ""
     stderr: str = ""
-    outcome: ShellCallOutcome = field(default_factory=_default_shell_outcome)
+    outcome: ShellCallOutcome = field(default_factory=lambda: ShellCallOutcome(type="exit"))
     command: str | None = None
     provider_data: dict[str, Any] | None = None
 
@@ -445,12 +794,63 @@ ShellExecutor = Callable[[ShellCommandRequest], MaybeAwaitable[Union[str, ShellR
 """Executes a shell command sequence and returns either text or structured output."""
 
 
+def _normalize_shell_tool_environment(
+    environment: ShellToolEnvironment | None,
+) -> ShellToolEnvironment:
+    """Normalize shell environment into a predictable mapping shape."""
+    if environment is None:
+        return {"type": "local"}
+    if not isinstance(environment, Mapping):
+        raise UserError("ShellTool environment must be a mapping.")
+
+    normalized = dict(environment)
+    if "type" not in normalized:
+        normalized["type"] = "local"
+    return cast(ShellToolEnvironment, normalized)
+
+
 @dataclass
 class ShellTool:
     """Next-generation shell tool. LocalShellTool will be deprecated in favor of this."""
 
-    executor: ShellExecutor
+    executor: ShellExecutor | None = None
     name: str = "shell"
+    needs_approval: bool | ShellApprovalFunction = False
+    """Whether the shell tool needs approval before execution. If True, the run will be interrupted
+    and the tool call will need to be approved using RunState.approve() or rejected using
+    RunState.reject() before continuing. Can be a bool (always/never needs approval) or a
+    function that takes (run_context, action, call_id) and returns whether this specific call
+    needs approval.
+    """
+    on_approval: ShellOnApprovalFunction | None = None
+    """Optional handler to auto-approve or reject when approval is required.
+    If provided, it will be invoked immediately when an approval is needed.
+    """
+    environment: ShellToolEnvironment | None = None
+    """Execution environment for shell commands.
+
+    If omitted, local mode is used.
+    """
+
+    def __post_init__(self) -> None:
+        """Validate shell tool configuration and normalize environment fields."""
+        normalized_environment = _normalize_shell_tool_environment(self.environment)
+        self.environment = normalized_environment
+
+        environment_type = normalized_environment["type"]
+        if environment_type == "local":
+            if self.executor is None:
+                raise UserError("ShellTool with local environment requires an executor.")
+            return
+
+        if self.executor is not None:
+            raise UserError("ShellTool with hosted environment does not accept an executor.")
+        if self.needs_approval is not False or self.on_approval is not None:
+            raise UserError(
+                "ShellTool with hosted environment does not support needs_approval or on_approval."
+            )
+        self.needs_approval = False
+        self.on_approval = None
 
     @property
     def type(self) -> str:
@@ -463,6 +863,17 @@ class ApplyPatchTool:
 
     editor: ApplyPatchEditor
     name: str = "apply_patch"
+    needs_approval: bool | ApplyPatchApprovalFunction = False
+    """Whether the apply_patch tool needs approval before execution. If True, the run will be
+    interrupted and the tool call will need to be approved using RunState.approve() or rejected
+    using RunState.reject() before continuing. Can be a bool (always/never needs approval) or a
+    function that takes (run_context, operation, call_id) and returns whether this specific call
+    needs approval.
+    """
+    on_approval: ApplyPatchOnApprovalFunction | None = None
+    """Optional handler to auto-approve or reject when approval is required.
+    If provided, it will be invoked immediately when an approval is needed.
+    """
 
     @property
     def type(self) -> str:
@@ -473,7 +884,7 @@ Tool = Union[
     FunctionTool,
     FileSearchTool,
     WebSearchTool,
-    ComputerTool,
+    ComputerTool[Any],
     HostedMCPTool,
     ShellTool,
     ApplyPatchTool,
@@ -484,12 +895,88 @@ Tool = Union[
 """A tool that can be used in an agent."""
 
 
+def _extract_json_decode_error(error: BaseException) -> json.JSONDecodeError | None:
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, json.JSONDecodeError):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _extract_tool_argument_json_error(error: Exception) -> json.JSONDecodeError | None:
+    if not isinstance(error, ModelBehaviorError):
+        return None
+    if not str(error).startswith("Invalid JSON input for tool"):
+        return None
+    return _extract_json_decode_error(error)
+
+
 def default_tool_error_function(ctx: RunContextWrapper[Any], error: Exception) -> str:
     """The default tool error function, which just returns a generic error message."""
+    json_decode_error = _extract_tool_argument_json_error(error)
+    if json_decode_error is not None:
+        return (
+            "An error occurred while parsing tool arguments. "
+            "Please try again with valid JSON. "
+            f"Error: {json_decode_error}"
+        )
     return f"An error occurred while running the tool. Please try again. Error: {str(error)}"
 
 
-ToolErrorFunction = Callable[[RunContextWrapper[Any], Exception], MaybeAwaitable[str]]
+_UNSET_FAILURE_ERROR_FUNCTION = object()
+_FUNCTION_TOOL_TIMEOUT_BEHAVIORS: tuple[ToolTimeoutBehavior, ...] = (
+    "error_as_result",
+    "raise_exception",
+)
+
+
+def default_tool_timeout_error_message(*, tool_name: str, timeout_seconds: float) -> str:
+    """Build the default message returned to the model when a tool times out."""
+    return f"Tool '{tool_name}' timed out after {timeout_seconds:g} seconds."
+
+
+async def invoke_function_tool(
+    *,
+    function_tool: FunctionTool,
+    context: ToolContext[Any],
+    arguments: str,
+) -> Any:
+    """Invoke a function tool, enforcing timeout configuration when provided."""
+    timeout_seconds = function_tool.timeout_seconds
+    if timeout_seconds is None:
+        return await function_tool.on_invoke_tool(context, arguments)
+
+    tool_task: asyncio.Future[Any] = asyncio.ensure_future(
+        function_tool.on_invoke_tool(context, arguments)
+    )
+    try:
+        return await asyncio.wait_for(tool_task, timeout=timeout_seconds)
+    except asyncio.TimeoutError as exc:
+        if tool_task.done() and not tool_task.cancelled():
+            tool_exception = tool_task.exception()
+            if tool_exception is None:
+                return tool_task.result()
+            raise tool_exception from None
+
+        timeout_error = ToolTimeoutError(
+            tool_name=function_tool.name,
+            timeout_seconds=timeout_seconds,
+        )
+        if function_tool.timeout_behavior == "raise_exception":
+            raise timeout_error from exc
+
+        timeout_error_function = function_tool.timeout_error_function
+        if timeout_error_function is None:
+            return default_tool_timeout_error_message(
+                tool_name=function_tool.name,
+                timeout_seconds=timeout_seconds,
+            )
+
+        timeout_result = timeout_error_function(context, timeout_error)
+        if inspect.isawaitable(timeout_result):
+            return await timeout_result
+        return timeout_result
 
 
 @overload
@@ -503,6 +990,13 @@ def function_tool(
     failure_error_function: ToolErrorFunction | None = None,
     strict_mode: bool = True,
     is_enabled: bool | Callable[[RunContextWrapper[Any], AgentBase], MaybeAwaitable[bool]] = True,
+    needs_approval: bool
+    | Callable[[RunContextWrapper[Any], dict[str, Any], str], Awaitable[bool]] = False,
+    tool_input_guardrails: list[ToolInputGuardrail[Any]] | None = None,
+    tool_output_guardrails: list[ToolOutputGuardrail[Any]] | None = None,
+    timeout: float | None = None,
+    timeout_behavior: ToolTimeoutBehavior = "error_as_result",
+    timeout_error_function: ToolErrorFunction | None = None,
 ) -> FunctionTool:
     """Overload for usage as @function_tool (no parentheses)."""
     ...
@@ -518,6 +1012,13 @@ def function_tool(
     failure_error_function: ToolErrorFunction | None = None,
     strict_mode: bool = True,
     is_enabled: bool | Callable[[RunContextWrapper[Any], AgentBase], MaybeAwaitable[bool]] = True,
+    needs_approval: bool
+    | Callable[[RunContextWrapper[Any], dict[str, Any], str], Awaitable[bool]] = False,
+    tool_input_guardrails: list[ToolInputGuardrail[Any]] | None = None,
+    tool_output_guardrails: list[ToolOutputGuardrail[Any]] | None = None,
+    timeout: float | None = None,
+    timeout_behavior: ToolTimeoutBehavior = "error_as_result",
+    timeout_error_function: ToolErrorFunction | None = None,
 ) -> Callable[[ToolFunction[...]], FunctionTool]:
     """Overload for usage as @function_tool(...)."""
     ...
@@ -530,9 +1031,16 @@ def function_tool(
     description_override: str | None = None,
     docstring_style: DocstringStyle | None = None,
     use_docstring_info: bool = True,
-    failure_error_function: ToolErrorFunction | None = default_tool_error_function,
+    failure_error_function: ToolErrorFunction | None | object = _UNSET_FAILURE_ERROR_FUNCTION,
     strict_mode: bool = True,
     is_enabled: bool | Callable[[RunContextWrapper[Any], AgentBase], MaybeAwaitable[bool]] = True,
+    needs_approval: bool
+    | Callable[[RunContextWrapper[Any], dict[str, Any], str], Awaitable[bool]] = False,
+    tool_input_guardrails: list[ToolInputGuardrail[Any]] | None = None,
+    tool_output_guardrails: list[ToolOutputGuardrail[Any]] | None = None,
+    timeout: float | None = None,
+    timeout_behavior: ToolTimeoutBehavior = "error_as_result",
+    timeout_error_function: ToolErrorFunction | None = None,
 ) -> FunctionTool | Callable[[ToolFunction[...]], FunctionTool]:
     """
     Decorator to create a FunctionTool from a function. By default, we will:
@@ -564,9 +1072,22 @@ def function_tool(
         is_enabled: Whether the tool is enabled. Can be a bool or a callable that takes the run
             context and agent and returns whether the tool is enabled. Disabled tools are hidden
             from the LLM at runtime.
+        needs_approval: Whether the tool needs approval before execution. If True, the run will
+            be interrupted and the tool call will need to be approved using RunState.approve() or
+            rejected using RunState.reject() before continuing. Can be a bool (always/never needs
+            approval) or a function that takes (run_context, tool_parameters, call_id) and returns
+            whether this specific call needs approval.
+        tool_input_guardrails: Optional list of guardrails to run before invoking the tool.
+        tool_output_guardrails: Optional list of guardrails to run after the tool returns.
+        timeout: Optional timeout in seconds for each tool call.
+        timeout_behavior: Timeout handling mode. "error_as_result" returns a model-visible message,
+            while "raise_exception" raises ToolTimeoutError and fails the run.
+        timeout_error_function: Optional formatter used for timeout messages when
+            timeout_behavior="error_as_result".
     """
 
     def _create_function_tool(the_func: ToolFunction[...]) -> FunctionTool:
+        is_sync_function_tool = not inspect.iscoroutinefunction(the_func)
         schema = function_schema(
             func=the_func,
             name_override=name_override,
@@ -607,16 +1128,16 @@ def function_tool(
             if not _debug.DONT_LOG_TOOL_DATA:
                 logger.debug(f"Tool call args: {args}, kwargs: {kwargs_dict}")
 
-            if inspect.iscoroutinefunction(the_func):
+            if not is_sync_function_tool:
                 if schema.takes_context:
                     result = await the_func(ctx, *args, **kwargs_dict)
                 else:
                     result = await the_func(*args, **kwargs_dict)
             else:
                 if schema.takes_context:
-                    result = the_func(ctx, *args, **kwargs_dict)
+                    result = await asyncio.to_thread(the_func, ctx, *args, **kwargs_dict)
                 else:
-                    result = the_func(*args, **kwargs_dict)
+                    result = await asyncio.to_thread(the_func, *args, **kwargs_dict)
 
             if _debug.DONT_LOG_TOOL_DATA:
                 logger.debug(f"Tool {schema.name} completed.")
@@ -629,19 +1150,35 @@ def function_tool(
             try:
                 return await _on_invoke_tool_impl(ctx, input)
             except Exception as e:
-                if failure_error_function is None:
+                resolved_failure_error_function: ToolErrorFunction | None
+                if failure_error_function is _UNSET_FAILURE_ERROR_FUNCTION:
+                    resolved_failure_error_function = default_tool_error_function
+                else:
+                    resolved_failure_error_function = cast(
+                        Optional[ToolErrorFunction], failure_error_function
+                    )
+
+                if resolved_failure_error_function is None:
                     raise
 
-                result = failure_error_function(ctx, e)
+                result = resolved_failure_error_function(ctx, e)
                 if inspect.isawaitable(result):
                     return await result
 
+                json_decode_error = _extract_tool_argument_json_error(e)
+                if json_decode_error is not None:
+                    span_error_message = "Error running tool"
+                    span_error_detail = str(json_decode_error)
+                else:
+                    span_error_message = "Error running tool (non-fatal)"
+                    span_error_detail = str(e)
+
                 _error_tracing.attach_error_to_current_span(
                     SpanError(
-                        message="Error running tool (non-fatal)",
+                        message=span_error_message,
                         data={
                             "tool_name": schema.name,
-                            "error": str(e),
+                            "error": span_error_detail,
                         },
                     )
                 )
@@ -654,6 +1191,9 @@ def function_tool(
                     )
                 return result
 
+        if is_sync_function_tool:
+            setattr(_on_invoke_tool, _SYNC_FUNCTION_TOOL_MARKER, True)
+
         return FunctionTool(
             name=schema.name,
             description=schema.description or "",
@@ -661,6 +1201,12 @@ def function_tool(
             on_invoke_tool=_on_invoke_tool,
             strict_json_schema=strict_mode,
             is_enabled=is_enabled,
+            needs_approval=needs_approval,
+            tool_input_guardrails=tool_input_guardrails,
+            tool_output_guardrails=tool_output_guardrails,
+            timeout_seconds=timeout,
+            timeout_behavior=timeout_behavior,
+            timeout_error_function=timeout_error_function,
         )
 
     # If func is actually a callable, we were used as @function_tool with no parentheses
@@ -672,3 +1218,71 @@ def function_tool(
         return _create_function_tool(real_func)
 
     return decorator
+
+
+# --------------------------
+# Private helpers
+# --------------------------
+
+
+def _is_computer_provider(candidate: object) -> bool:
+    return isinstance(candidate, ComputerProvider) or (
+        hasattr(candidate, "create") and callable(candidate.create)
+    )
+
+
+def _validate_function_tool_timeout_config(tool: FunctionTool) -> None:
+    timeout_seconds = tool.timeout_seconds
+    if timeout_seconds is not None:
+        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+            raise TypeError(
+                "FunctionTool timeout_seconds must be a positive number in seconds or None."
+            )
+        timeout_seconds = float(timeout_seconds)
+        if not math.isfinite(timeout_seconds):
+            raise ValueError("FunctionTool timeout_seconds must be a finite number.")
+        if timeout_seconds <= 0:
+            raise ValueError("FunctionTool timeout_seconds must be greater than 0.")
+        if getattr(tool.on_invoke_tool, _SYNC_FUNCTION_TOOL_MARKER, False):
+            raise ValueError(
+                "FunctionTool timeout_seconds is only supported for async @function_tool handlers."
+            )
+        tool.timeout_seconds = timeout_seconds
+
+    if tool.timeout_behavior not in _FUNCTION_TOOL_TIMEOUT_BEHAVIORS:
+        raise ValueError(
+            "FunctionTool timeout_behavior must be one of: "
+            + ", ".join(_FUNCTION_TOOL_TIMEOUT_BEHAVIORS)
+        )
+
+    if tool.timeout_error_function is not None and not callable(tool.timeout_error_function):
+        raise TypeError("FunctionTool timeout_error_function must be callable or None.")
+
+
+def _store_computer_initializer(tool: ComputerTool[Any]) -> None:
+    config = tool.computer
+    if callable(config) or _is_computer_provider(config):
+        _computer_initializer_map[tool] = config
+
+
+def _get_computer_initializer(tool: ComputerTool[Any]) -> ComputerConfig[Any] | None:
+    if tool in _computer_initializer_map:
+        return _computer_initializer_map[tool]
+
+    if callable(tool.computer) or _is_computer_provider(tool.computer):
+        return tool.computer
+
+    return None
+
+
+def _track_resolved_computer(
+    *,
+    tool: ComputerTool[Any],
+    run_context: RunContextWrapper[Any],
+    resolved: _ResolvedComputer,
+) -> None:
+    resolved_by_run = _computers_by_run_context.get(run_context)
+    if resolved_by_run is None:
+        resolved_by_run = {}
+        _computers_by_run_context[run_context] = resolved_by_run
+    resolved_by_run[tool] = resolved

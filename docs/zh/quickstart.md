@@ -4,9 +4,9 @@ search:
 ---
 # 快速开始
 
-## 创建项目和虚拟环境
+## 创建项目与虚拟环境
 
-你只需执行一次。
+只需执行一次。
 
 ```bash
 mkdir my_project
@@ -16,7 +16,7 @@ python -m venv .venv
 
 ### 激活虚拟环境
 
-每次开启新的终端会话都需要执行。
+每次启动新的终端会话时都需要执行。
 
 ```bash
 source .venv/bin/activate
@@ -28,17 +28,17 @@ source .venv/bin/activate
 pip install openai-agents # or `uv add openai-agents`, etc
 ```
 
-### 设置 OpenAI API 密钥
+### 设置 OpenAI API key
 
-如果你还没有，请按照[这些说明](https://platform.openai.com/docs/quickstart#create-and-export-an-api-key)创建一个 OpenAI API 密钥。
+如果你还没有，请按照[这些说明](https://platform.openai.com/docs/quickstart#create-and-export-an-api-key)创建一个 OpenAI API key。
 
 ```bash
 export OPENAI_API_KEY=sk-...
 ```
 
-## 创建你的第一个智能体
+## 创建首个智能体
 
-智能体由 instructions、名称，以及可选配置（如 `model_config`）定义。
+使用 instructions、名称和可选配置（如 `model_config`）定义智能体。
 
 ```python
 from agents import Agent
@@ -49,9 +49,9 @@ agent = Agent(
 )
 ```
 
-## 再添加几个智能体
+## 添加更多智能体
 
-可以用相同方式定义其他智能体。`handoff_descriptions` 提供额外上下文以确定任务转移路由。
+可以用相同方式定义其他智能体。`handoff_descriptions` 为确定任务转移路由提供附加上下文。
 
 ```python
 from agents import Agent
@@ -69,9 +69,9 @@ math_tutor_agent = Agent(
 )
 ```
 
-## 定义你的任务转移
+## 定义任务转移
 
-在每个智能体上，你可以定义一个可用的外发任务转移选项清单，供智能体选择以决定如何推进其任务。
+在每个智能体上，你可以定义一个外发任务转移选项的清单，智能体可从中选择以决定如何推进其任务。
 
 ```python
 triage_agent = Agent(
@@ -83,19 +83,19 @@ triage_agent = Agent(
 
 ## 运行智能体编排
 
-我们来检查工作流是否运行正常，以及分诊智能体是否在两个专家智能体之间正确路由。
+检查工作流是否运行，以及分诊智能体是否在两个专家智能体之间正确路由。
 
 ```python
 from agents import Runner
 
 async def main():
-    result = await Runner.run(triage_agent, "What is the capital of France?")
+    result = await Runner.run(triage_agent, "who was the first president of the united states?")
     print(result.final_output)
 ```
 
 ## 添加安全防护措施
 
-你可以定义自定义安全防护措施，用于在输入或输出上运行。
+你可以定义自定义安全防护措施，作用于输入或输出。
 
 ```python
 from agents import GuardrailFunctionOutput, Agent, Runner
@@ -121,9 +121,9 @@ async def homework_guardrail(ctx, agent, input_data):
     )
 ```
 
-## 汇总整合
+## 整合运行
 
-将以上内容整合在一起，运行完整工作流，使用任务转移和输入安全防护措施。
+将以上组合起来，使用任务转移和输入安全防护措施运行整个工作流。
 
 ```python
 from agents import Agent, InputGuardrail, GuardrailFunctionOutput, Runner
@@ -190,14 +190,14 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-## 查看你的追踪
+## 查看追踪
 
-要回顾智能体运行期间发生的情况，请前往 [OpenAI 控制台中的 Trace 查看器](https://platform.openai.com/traces)查看你的追踪。
+要回顾智能体运行过程中的事件，请前往 [OpenAI Dashboard 中的 Trace viewer](https://platform.openai.com/traces) 查看运行追踪。
 
 ## 后续步骤
 
 了解如何构建更复杂的智能体流程：
 
-- 了解如何配置 [Agents](agents.md)。
-- 了解如何[运行智能体](running_agents.md)。
+- 学习如何配置[智能体](agents.md)。
+- 了解[运行智能体](running_agents.md)。
 - 了解[工具](tools.md)、[安全防护措施](guardrails.md)和[模型](models/index.md)。

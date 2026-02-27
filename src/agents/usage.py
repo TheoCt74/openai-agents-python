@@ -1,12 +1,80 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import field
-from typing import Annotated
+from typing import Annotated, Any
 
 from openai.types.completion_usage import CompletionTokensDetails, PromptTokensDetails
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
-from pydantic import BeforeValidator
+from pydantic import BeforeValidator, TypeAdapter, ValidationError
 from pydantic.dataclasses import dataclass
+
+
+def deserialize_usage(usage_data: Mapping[str, Any]) -> Usage:
+    """Rebuild a Usage object from serialized JSON data."""
+    input_tokens_details_raw = usage_data.get("input_tokens_details")
+    output_tokens_details_raw = usage_data.get("output_tokens_details")
+    input_details = _coerce_token_details(
+        TypeAdapter(InputTokensDetails),
+        input_tokens_details_raw or {"cached_tokens": 0},
+        InputTokensDetails(cached_tokens=0),
+    )
+    output_details = _coerce_token_details(
+        TypeAdapter(OutputTokensDetails),
+        output_tokens_details_raw or {"reasoning_tokens": 0},
+        OutputTokensDetails(reasoning_tokens=0),
+    )
+
+    request_entries: list[RequestUsage] = []
+    request_entries_raw = usage_data.get("request_usage_entries") or []
+    for entry in request_entries_raw:
+        request_entries.append(
+            RequestUsage(
+                input_tokens=entry.get("input_tokens", 0),
+                output_tokens=entry.get("output_tokens", 0),
+                total_tokens=entry.get("total_tokens", 0),
+                input_tokens_details=_coerce_token_details(
+                    TypeAdapter(InputTokensDetails),
+                    entry.get("input_tokens_details") or {"cached_tokens": 0},
+                    InputTokensDetails(cached_tokens=0),
+                ),
+                output_tokens_details=_coerce_token_details(
+                    TypeAdapter(OutputTokensDetails),
+                    entry.get("output_tokens_details") or {"reasoning_tokens": 0},
+                    OutputTokensDetails(reasoning_tokens=0),
+                ),
+            )
+        )
+
+    return Usage(
+        requests=usage_data.get("requests", 0),
+        input_tokens=usage_data.get("input_tokens", 0),
+        output_tokens=usage_data.get("output_tokens", 0),
+        total_tokens=usage_data.get("total_tokens", 0),
+        input_tokens_details=input_details,
+        output_tokens_details=output_details,
+        request_usage_entries=request_entries,
+    )
+
+
+@dataclass
+class RequestUsage:
+    """Usage details for a single API request."""
+
+    input_tokens: int
+    """Input tokens for this individual request."""
+
+    output_tokens: int
+    """Output tokens for this individual request."""
+
+    total_tokens: int
+    """Total tokens (input + output) for this individual request."""
+
+    input_tokens_details: InputTokensDetails
+    """Details about the input tokens for this individual request."""
+
+    output_tokens_details: OutputTokensDetails
+    """Details about the output tokens for this individual request."""
 
 
 def _normalize_input_tokens_details(
@@ -29,26 +97,6 @@ def _normalize_output_tokens_details(
     if isinstance(v, CompletionTokensDetails):
         return OutputTokensDetails(reasoning_tokens=v.reasoning_tokens or 0)
     return v
-
-
-@dataclass
-class RequestUsage:
-    """Usage details for a single API request."""
-
-    input_tokens: int
-    """Input tokens for this individual request."""
-
-    output_tokens: int
-    """Output tokens for this individual request."""
-
-    total_tokens: int
-    """Total tokens (input + output) for this individual request."""
-
-    input_tokens_details: InputTokensDetails
-    """Details about the input tokens for this individual request."""
-
-    output_tokens_details: OutputTokensDetails
-    """Details about the output tokens for this individual request."""
 
 
 @dataclass
@@ -92,9 +140,18 @@ class Usage:
         # (cached_tokens, reasoning_tokens), and the OpenAI SDK's generated
         # code can bypass Pydantic validation (e.g., via model_construct),
         # allowing None values. We normalize these to 0 to prevent TypeErrors.
-        if self.input_tokens_details.cached_tokens is None:
+        input_details_none = self.input_tokens_details is None
+        input_cached_none = (
+            not input_details_none and self.input_tokens_details.cached_tokens is None
+        )
+        if input_details_none or input_cached_none:
             self.input_tokens_details = InputTokensDetails(cached_tokens=0)
-        if self.output_tokens_details.reasoning_tokens is None:
+
+        output_details_none = self.output_tokens_details is None
+        output_reasoning_none = (
+            not output_details_none and self.output_tokens_details.reasoning_tokens is None
+        )
+        if output_details_none or output_reasoning_none:
             self.output_tokens_details = OutputTokensDetails(reasoning_tokens=0)
 
     def add(self, other: Usage) -> None:
@@ -109,27 +166,99 @@ class Usage:
         self.input_tokens += other.input_tokens if other.input_tokens else 0
         self.output_tokens += other.output_tokens if other.output_tokens else 0
         self.total_tokens += other.total_tokens if other.total_tokens else 0
-        self.input_tokens_details = InputTokensDetails(
-            cached_tokens=self.input_tokens_details.cached_tokens
-            + other.input_tokens_details.cached_tokens
+
+        # Null guards for nested token details (other may bypass validation via model_construct)
+        other_cached = (
+            other.input_tokens_details.cached_tokens
+            if other.input_tokens_details and other.input_tokens_details.cached_tokens
+            else 0
+        )
+        other_reasoning = (
+            other.output_tokens_details.reasoning_tokens
+            if other.output_tokens_details and other.output_tokens_details.reasoning_tokens
+            else 0
+        )
+        self_cached = (
+            self.input_tokens_details.cached_tokens
+            if self.input_tokens_details and self.input_tokens_details.cached_tokens
+            else 0
+        )
+        self_reasoning = (
+            self.output_tokens_details.reasoning_tokens
+            if self.output_tokens_details and self.output_tokens_details.reasoning_tokens
+            else 0
         )
 
+        self.input_tokens_details = InputTokensDetails(cached_tokens=self_cached + other_cached)
+
         self.output_tokens_details = OutputTokensDetails(
-            reasoning_tokens=self.output_tokens_details.reasoning_tokens
-            + other.output_tokens_details.reasoning_tokens
+            reasoning_tokens=self_reasoning + other_reasoning
         )
 
         # Automatically preserve request_usage_entries.
         # If the other Usage represents a single request with tokens, record it.
         if other.requests == 1 and other.total_tokens > 0:
+            input_details = other.input_tokens_details or InputTokensDetails(cached_tokens=0)
+            output_details = other.output_tokens_details or OutputTokensDetails(reasoning_tokens=0)
             request_usage = RequestUsage(
                 input_tokens=other.input_tokens,
                 output_tokens=other.output_tokens,
                 total_tokens=other.total_tokens,
-                input_tokens_details=other.input_tokens_details,
-                output_tokens_details=other.output_tokens_details,
+                input_tokens_details=input_details,
+                output_tokens_details=output_details,
             )
             self.request_usage_entries.append(request_usage)
         elif other.request_usage_entries:
             # If the other Usage already has individual request breakdowns, merge them.
             self.request_usage_entries.extend(other.request_usage_entries)
+
+
+def _serialize_usage_details(details: Any, default: dict[str, int]) -> dict[str, Any]:
+    """Serialize token details while applying the given default when empty."""
+    if hasattr(details, "model_dump"):
+        serialized = details.model_dump()
+        if isinstance(serialized, dict) and serialized:
+            return serialized
+    return dict(default)
+
+
+def serialize_usage(usage: Usage) -> dict[str, Any]:
+    """Serialize a Usage object into a JSON-friendly dictionary."""
+    input_details = _serialize_usage_details(usage.input_tokens_details, {"cached_tokens": 0})
+    output_details = _serialize_usage_details(usage.output_tokens_details, {"reasoning_tokens": 0})
+
+    def _serialize_request_entry(entry: RequestUsage) -> dict[str, Any]:
+        return {
+            "input_tokens": entry.input_tokens,
+            "output_tokens": entry.output_tokens,
+            "total_tokens": entry.total_tokens,
+            "input_tokens_details": _serialize_usage_details(
+                entry.input_tokens_details, {"cached_tokens": 0}
+            ),
+            "output_tokens_details": _serialize_usage_details(
+                entry.output_tokens_details, {"reasoning_tokens": 0}
+            ),
+        }
+
+    return {
+        "requests": usage.requests,
+        "input_tokens": usage.input_tokens,
+        "input_tokens_details": [input_details],
+        "output_tokens": usage.output_tokens,
+        "output_tokens_details": [output_details],
+        "total_tokens": usage.total_tokens,
+        "request_usage_entries": [
+            _serialize_request_entry(entry) for entry in usage.request_usage_entries
+        ],
+    }
+
+
+def _coerce_token_details(adapter: TypeAdapter[Any], raw_value: Any, default: Any) -> Any:
+    """Deserialize token details safely with a fallback value."""
+    candidate = raw_value
+    if isinstance(candidate, list) and candidate:
+        candidate = candidate[0]
+    try:
+        return adapter.validate_python(candidate)
+    except ValidationError:
+        return default
