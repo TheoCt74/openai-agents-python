@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import functools
 import os
 import re
 import shlex
@@ -32,6 +33,19 @@ LOG_DIR_DEFAULT = ROOT_DIR / ".tmp" / "examples-start-logs"
 RERUN_FILE_DEFAULT = ROOT_DIR / ".tmp" / "examples-rerun.txt"
 DEFAULT_MAIN_LOG = LOG_DIR_DEFAULT / f"main_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
 
+COMMON_PATH_HINTS = (
+    Path.home() / ".local" / "bin",
+    Path("/opt/homebrew/bin"),
+    Path("/opt/homebrew/sbin"),
+    Path("/usr/local/bin"),
+    Path("/usr/local/sbin"),
+)
+
+DISCOVERY_EXCLUDE = {
+    "examples/run_examples.py",
+    "examples/sandbox/tutorials/data/dataroom/setup.py",
+}
+
 # Examples that are noisy, require extra credentials, or hang in auto runs.
 DEFAULT_AUTO_SKIP = {
     "examples/agent_patterns/llm_as_a_judge.py",
@@ -39,12 +53,36 @@ DEFAULT_AUTO_SKIP = {
     "examples/customer_service/main.py",
     "examples/hosted_mcp/connectors.py",
     "examples/mcp/git_example/main.py",
+    # These are helper daemons or multi-process components exercised by sibling examples.
+    "examples/mcp/manager_example/app.py",
+    "examples/mcp/manager_example/mcp_server.py",
+    "examples/mcp/prompt_server/server.py",
+    "examples/mcp/sse_example/server.py",
+    "examples/mcp/streamablehttp_custom_client_example/server.py",
+    "examples/mcp/streamablehttp_example/server.py",
     "examples/model_providers/custom_example_agent.py",
     "examples/model_providers/custom_example_global.py",
     "examples/model_providers/custom_example_provider.py",
     "examples/realtime/app/server.py",
     "examples/realtime/cli/demo.py",
     "examples/realtime/twilio/server.py",
+    "examples/sandbox/docker/mounts/azure_mount_read_write.py",
+    "examples/sandbox/docker/mounts/gcs_mount_read_write.py",
+    "examples/sandbox/docker/mounts/s3_files_mount_read_write.py",
+    "examples/sandbox/docker/mounts/s3_mount_read_write.py",
+    "examples/sandbox/extensions/daytona/usaspending_text2sql/setup_db.py",
+    "examples/sandbox/extensions/temporal/temporal_sandbox_agent.py",
+    "examples/sandbox/extensions/vercel_runner.py",
+    "examples/sandbox/memory_s3.py",
+    "examples/sandbox/sandbox_agent_with_remote_snapshot.py",
+    "examples/sandbox/tax_prep.py",
+    "examples/sandbox/tutorials/dataroom_metric_extract/evals.py",
+    "examples/sandbox/tutorials/dataroom_metric_extract/main.py",
+    "examples/sandbox/tutorials/dataroom_qa/main.py",
+    "examples/sandbox/tutorials/repo_code_review/evals.py",
+    "examples/sandbox/tutorials/repo_code_review/main.py",
+    "examples/sandbox/tutorials/vision_website_clone/main.py",
+    "examples/tools/codex_same_thread.py",
     "examples/voice/static/main.py",
     "examples/voice/streamed/main.py",
 }
@@ -82,6 +120,70 @@ class ExampleResult:
 def normalize_relpath(relpath: str) -> str:
     normalized = relpath.replace("\\", "/")
     return str(PurePosixPath(normalized))
+
+
+def split_path_entries(path_value: str) -> list[str]:
+    return [entry for entry in path_value.split(os.pathsep) if entry]
+
+
+def dedupe_existing_paths(paths: Iterable[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for entry in paths:
+        expanded = os.path.expanduser(entry)
+        if not expanded or expanded in seen:
+            continue
+        if not Path(expanded).exists():
+            continue
+        deduped.append(expanded)
+        seen.add(expanded)
+    return deduped
+
+
+@functools.lru_cache(maxsize=1)
+def interactive_shell_path() -> str | None:
+    shell = os.environ.get("SHELL")
+    if not shell:
+        return None
+
+    shell_name = Path(shell).name
+    if shell_name not in {"bash", "zsh"}:
+        return None
+
+    try:
+        result = subprocess.run(
+            [shell, "-lic", 'printf "%s" "$PATH"'],
+            capture_output=True,
+            check=True,
+            cwd=ROOT_DIR,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    path_value = result.stdout.strip()
+    return path_value or None
+
+
+def build_command_path(base_path: str | None = None) -> str:
+    candidates: list[str] = []
+    if base_path is None:
+        base_path = os.environ.get("PATH", "")
+    candidates.extend(split_path_entries(base_path))
+
+    shell_path = interactive_shell_path()
+    if shell_path:
+        candidates.extend(split_path_entries(shell_path))
+
+    candidates.extend(str(path) for path in COMMON_PATH_HINTS)
+    return os.pathsep.join(dedupe_existing_paths(candidates))
+
+
+def build_python_path(base_path: str | None = None) -> str:
+    candidates = [str(ROOT_DIR)]
+    if base_path:
+        candidates.extend(split_path_entries(base_path))
+    return os.pathsep.join(dedupe_existing_paths(candidates))
 
 
 def parse_args() -> argparse.Namespace:
@@ -221,6 +323,10 @@ def discover_examples(filters: Iterable[str]) -> list[ExampleScript]:
         if not MAIN_PATTERN.search(source):
             continue
 
+        relpath = normalize_relpath(str(path.relative_to(ROOT_DIR)))
+        if relpath in DISCOVERY_EXCLUDE:
+            continue
+
         if filters_lower and not any(
             f in str(path.relative_to(ROOT_DIR)).lower() for f in filters_lower
         ):
@@ -351,6 +457,11 @@ def run_examples(examples: Sequence[ExampleScript], args: argparse.Namespace) ->
     buffer_output = not args.no_buffer_output and os.environ.get(
         "EXAMPLES_BUFFER_OUTPUT", "1"
     ).lower() not in {"0", "false", "no", "off"}
+    command_path = build_command_path()
+    path_augmented = command_path != os.environ.get("PATH", "")
+
+    if path_augmented:
+        print("Augmented subprocess PATH using interactive shell/common tool directories.")
 
     def safe_write_main(line: str) -> None:
         with main_log_lock:
@@ -363,6 +474,8 @@ def run_examples(examples: Sequence[ExampleScript], args: argparse.Namespace) ->
         ensure_dirs(log_path, is_file=True)
 
         env = os.environ.copy()
+        env["PATH"] = command_path
+        env["PYTHONPATH"] = build_python_path(env.get("PYTHONPATH"))
         if auto_mode:
             env["EXAMPLES_INTERACTIVE_MODE"] = "auto"
             env["APPLY_PATCH_AUTO_APPROVE"] = "1"
@@ -441,6 +554,7 @@ def run_examples(examples: Sequence[ExampleScript], args: argparse.Namespace) ->
         safe_write_main(f"# logs_dir: {logs_dir}")
         safe_write_main(f"# jobs: {jobs}")
         safe_write_main(f"# buffer_output: {buffer_output}")
+        safe_write_main(f"# path_augmented: {path_augmented}")
 
         run_list: list[ExampleScript] = []
 

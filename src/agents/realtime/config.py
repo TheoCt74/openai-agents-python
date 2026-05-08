@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Literal, Union
+from typing import Any, Literal, TypeAlias
 
 from openai.types.realtime.realtime_audio_formats import (
     RealtimeAudioFormats as OpenAIRealtimeAudioFormats,
 )
-from typing_extensions import NotRequired, TypeAlias, TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 from agents.prompts import Prompt
 
@@ -16,10 +16,11 @@ from ..model_settings import ToolChoice
 from ..run_config import ToolErrorFormatter
 from ..tool import Tool
 
-RealtimeModelName: TypeAlias = Union[
+RealtimeModelName: TypeAlias = (
     Literal[
         "gpt-realtime",
         "gpt-realtime-1.5",
+        "gpt-realtime-2",
         "gpt-realtime-2025-08-28",
         "gpt-4o-realtime-preview",
         "gpt-4o-realtime-preview-2024-10-01",
@@ -30,19 +31,23 @@ RealtimeModelName: TypeAlias = Union[
         "gpt-realtime-mini",
         "gpt-realtime-mini-2025-10-06",
         "gpt-realtime-mini-2025-12-15",
-    ],
-    str,
-]
+    ]
+    | str
+)
 """The name of a realtime model."""
 
 
-RealtimeAudioFormat: TypeAlias = Union[
-    Literal["pcm16", "g711_ulaw", "g711_alaw"],
-    str,
-    Mapping[str, Any],
-    OpenAIRealtimeAudioFormats,
-]
+RealtimeAudioFormat: TypeAlias = (
+    Literal["pcm16", "g711_ulaw", "g711_alaw"]
+    | str
+    | Mapping[str, Any]
+    | OpenAIRealtimeAudioFormats
+)
 """The audio format for realtime audio streams."""
+
+
+RealtimeReasoningEffort: TypeAlias = Literal["minimal", "low", "medium", "high", "xhigh"] | str
+"""The reasoning effort for realtime model responses."""
 
 
 class RealtimeClientMessage(TypedDict):
@@ -130,6 +135,13 @@ class RealtimeAudioConfig(TypedDict, total=False):
     output: RealtimeAudioOutputConfig
 
 
+class RealtimeReasoningConfig(TypedDict, total=False):
+    """Reasoning configuration for realtime sessions."""
+
+    effort: RealtimeReasoningEffort
+    """The reasoning effort to use for realtime model responses."""
+
+
 class RealtimeSessionModelSettings(TypedDict):
     """Model settings for a realtime model session."""
 
@@ -174,6 +186,12 @@ class RealtimeSessionModelSettings(TypedDict):
 
     tool_choice: NotRequired[ToolChoice]
     """How the model should choose which tools to call."""
+
+    parallel_tool_calls: NotRequired[bool]
+    """Whether the model may make parallel tool calls."""
+
+    reasoning: NotRequired[RealtimeReasoningConfig]
+    """Reasoning configuration for realtime model responses."""
 
     tools: NotRequired[list[Tool]]
     """List of tools available to the model."""
@@ -264,5 +282,5 @@ class RealtimeUserInputMessage(TypedDict):
     """List of content items (text and image) in the message."""
 
 
-RealtimeUserInput: TypeAlias = Union[str, RealtimeUserInputMessage]
+RealtimeUserInput: TypeAlias = str | RealtimeUserInputMessage
 """User input that can be a string or structured message."""

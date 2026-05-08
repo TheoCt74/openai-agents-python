@@ -2,160 +2,261 @@
 search:
   exclude: true
 ---
-# Realtime エージェントガイド
+# リアルタイムエージェントガイド
 
-このガイドでは、OpenAI Agents SDK の realtime 機能を使用して音声対応 AI エージェントを構築する方法を、詳しく解説します。
+このガイドでは、OpenAI Agents SDK のリアルタイムレイヤーが OpenAI Realtime API にどのように対応するか、また Python SDK がその上に追加する挙動について説明します。
 
-!!! warning "Beta feature"
-Realtime エージェントはベータ版です。実装を改善する過程で、破壊的変更が発生する可能性があります。
+!!! warning "ベータ機能"
+
+    リアルタイムエージェントはベータ版です。実装の改善に伴い、破壊的変更が発生する可能性があります。
+
+!!! note "最初に読むもの"
+
+    デフォルトの Python パスを使いたい場合は、まず [クイックスタート](quickstart.md) を読んでください。アプリでサーバーサイド WebSocket と SIP のどちらを使うべきかを検討している場合は、[リアルタイムトランスポート](transport.md) を読んでください。ブラウザーの WebRTC トランスポートは Python SDK の一部ではありません。
 
 ## 概要
 
-Realtime エージェントにより、音声とテキストの入力をリアルタイムに処理し、realtime 音声で応答する対話フローを実現できます。OpenAI の Realtime API との永続接続を維持し、低レイテンシの自然な音声会話と、割り込みを適切に扱う機能を提供します。
+リアルタイムエージェントは Realtime API への長時間接続を維持し、モデルがテキストと音声を段階的に処理し、音声出力をストリーミングし、ツールを呼び出し、各ターンで新しいリクエストを再開することなく割り込みを処理できるようにします。
 
-## アーキテクチャ
+主な SDK コンポーネントは次のとおりです。
 
-### 中核コンポーネント
+-   **RealtimeAgent**: 1 つのリアルタイム専門エージェント向けの instructions、ツール、出力ガードレール、ハンドオフ
+-   **RealtimeRunner**: 開始エージェントをリアルタイムトランスポートに接続するセッションファクトリー
+-   **RealtimeSession**: 入力を送信し、イベントを受信し、履歴を追跡し、ツールを実行するライブセッション
+-   **RealtimeModel**: トランスポート抽象化です。デフォルトは OpenAI のサーバーサイド WebSocket 実装です。
 
-realtime システムは、いくつかの主要コンポーネントで構成されます。
+## セッションライフサイクル
 
--   **RealtimeAgent**: `instructions`、`tools`、`handoffs` で構成されたエージェントです。
--   **RealtimeRunner**: 設定を管理します。`runner.run()` を呼び出してセッションを取得できます。
--   **RealtimeSession**: 単一の対話セッションです。通常、ユーザーが会話を開始するたびに 1 つ作成し、会話が終了するまで維持します。
--   **RealtimeModel**: 基盤となるモデルのインターフェース（通常は OpenAI の WebSocket 実装）
+典型的なリアルタイムセッションは次のようになります。
 
-### セッションフロー
+1. 1 つ以上の `RealtimeAgent` を作成します。
+2. 開始エージェントで `RealtimeRunner` を作成します。
+3. `await runner.run()` を呼び出して `RealtimeSession` を取得します。
+4. `async with session:` または `await session.enter()` でセッションに入ります。
+5. `send_message()` または `send_audio()` でユーザー入力を送信します。
+6. 会話が終了するまでセッションイベントを反復処理します。
 
-典型的な realtime セッションは、次のフローに従います。
+テキストのみの実行とは異なり、`runner.run()` は最終的な実行結果をすぐには生成しません。ローカル履歴、バックグラウンドのツール実行、ガードレール状態、アクティブなエージェント設定をトランスポート層と同期し続けるライブセッションオブジェクトを返します。
 
-1. `instructions`、`tools`、`handoffs` を指定して **RealtimeAgent を作成**します。
-2. エージェントと設定オプションで **RealtimeRunner をセットアップ**します。
-3. `await runner.run()` を使って **セッションを開始**します。戻り値は RealtimeSession です。
-4. `send_audio()` または `send_message()` を使って、セッションへ **音声またはテキストメッセージを送信**します。
-5. セッションを反復して **イベントを購読**します。イベントには、音声出力、文字起こし、ツール呼び出し、ハンドオフ、エラーが含まれます。
-6. ユーザーがエージェントの発話にかぶせて話した場合に **割り込みを処理**します。これにより現在の音声生成が自動的に停止します。
+デフォルトでは、`RealtimeRunner` は `OpenAIRealtimeWebSocketModel` を使用するため、デフォルトの Python パスは Realtime API へのサーバーサイド WebSocket 接続です。別の `RealtimeModel` を渡した場合でも、同じセッションライフサイクルとエージェント機能が適用されますが、接続の仕組みは変わる場合があります。
 
-このセッションは会話履歴を維持し、realtime モデルとの永続接続を管理します。
+## エージェントとセッション設定
 
-## エージェント設定
+`RealtimeAgent` は、通常の `Agent` 型より意図的に範囲が狭くなっています。
 
-RealtimeAgent は通常の Agent クラスと同様に動作しますが、いくつか重要な違いがあります。API の詳細は、[`RealtimeAgent`][agents.realtime.agent.RealtimeAgent] の API リファレンスを参照してください。
+-   モデル選択はエージェントごとではなく、セッションレベルで設定します。
+-   structured outputs はサポートされていません。
+-   音声は設定できますが、セッションがすでに発話音声を生成した後に変更することはできません。
+-   instructions、関数ツール、ハンドオフ、フック、出力ガードレールはすべて引き続き機能します。
 
-通常のエージェントとの主な違い:
+`RealtimeSessionModelSettings` は、新しいネストされた `audio` 設定と古いフラットなエイリアスの両方をサポートします。新しいコードではネストされた形を優先し、新しいリアルタイムエージェントでは `gpt-realtime-2` から始めてください。
 
--   モデル選択は、エージェント単位ではなくセッション単位で設定します。
--   structured output のサポートはありません（`outputType` はサポートされません）。
--   音声はエージェントごとに設定できますが、最初のエージェントが話した後は変更できません。
--   それ以外の `tools`、`handoffs`、`instructions` などの機能は同様に動作します。
+```python
+runner = RealtimeRunner(
+    starting_agent=agent,
+    config={
+        "model_settings": {
+            "model_name": "gpt-realtime-2",
+            "audio": {
+                "input": {
+                    "format": "pcm16",
+                    "transcription": {"model": "gpt-4o-mini-transcribe"},
+                    "turn_detection": {"type": "semantic_vad", "interrupt_response": True},
+                },
+                "output": {"format": "pcm16", "voice": "ash"},
+            },
+            "tool_choice": "auto",
+        }
+    },
+)
+```
 
-## セッション設定
+便利なセッションレベル設定には次のものがあります。
 
-### モデル設定
+-   `audio.input.format`, `audio.output.format`
+-   `audio.input.transcription`
+-   `audio.input.noise_reduction`
+-   `audio.input.turn_detection`
+-   `audio.output.voice`, `audio.output.speed`
+-   `output_modalities`
+-   `tool_choice`
+-   `prompt`
+-   `tracing`
 
-セッション設定では、基盤となる realtime モデルの挙動を制御できます。モデル名（`gpt-realtime` など）、音声（alloy、echo、fable、onyx、nova、shimmer）、対応モダリティ（テキストおよび/または音声）を設定できます。音声フォーマットは入力と出力の両方で設定でき、既定は PCM16 です。
+`RealtimeRunner(config=...)` の便利な実行レベル設定には次のものがあります。
 
-### 音声設定
+-   `async_tool_calls`
+-   `output_guardrails`
+-   `guardrails_settings.debounce_text_length`
+-   `tool_error_formatter`
+-   `tracing_disabled`
 
-音声設定は、セッションが音声入力と出力をどのように扱うかを制御します。Whisper などのモデルを使用した入力音声の文字起こし、言語の優先設定、専門用語の精度向上のための文字起こしプロンプトを設定できます。ターン検出設定では、エージェントがいつ応答を開始・停止すべきかを制御し、音声活動検出のしきい値、無音時間、検出された発話の前後のパディングなどのオプションがあります。
+型付きの全体仕様については、[`RealtimeRunConfig`][agents.realtime.config.RealtimeRunConfig] と [`RealtimeSessionModelSettings`][agents.realtime.config.RealtimeSessionModelSettings] を参照してください。
 
-`RealtimeRunner(config=...)` で設定できる追加オプションには、次が含まれます。
+## 入力と出力
 
--   `model_settings.output_modalities` で、出力をテキストおよび/または音声に制約します。
--   `model_settings.input_audio_noise_reduction` で、近距離/遠距離音声向けのノイズ低減を調整します。
--   `guardrails_settings.debounce_text_length` で、出力ガードレールの実行頻度を制御します。
--   `async_tool_calls` で、関数ツールを並行実行します。
--   `tool_error_formatter` で、モデルに見えるツールのエラーメッセージをカスタマイズします。
+### テキストと構造化されたユーザーメッセージ
 
-型付きの設定全体については、[`RealtimeRunConfig`][agents.realtime.config.RealtimeRunConfig] と [`RealtimeSessionModelSettings`][agents.realtime.config.RealtimeSessionModelSettings] を参照してください。
+プレーンテキストまたは構造化されたリアルタイムメッセージには [`session.send_message()`][agents.realtime.session.RealtimeSession.send_message] を使用します。
 
-## ツールと関数
+```python
+from agents.realtime import RealtimeUserInputMessage
 
-### ツールの追加
+await session.send_message("Summarize what we discussed so far.")
 
-通常のエージェントと同様に、realtime エージェントは会話中に実行される関数ツールをサポートします。
+message: RealtimeUserInputMessage = {
+    "type": "message",
+    "role": "user",
+    "content": [
+        {"type": "input_text", "text": "Describe this image."},
+        {"type": "input_image", "image_url": image_data_url, "detail": "high"},
+    ],
+}
+await session.send_message(message)
+```
+
+構造化メッセージは、リアルタイム会話に画像入力を含める主な方法です。[`examples/realtime/app/server.py`](https://github.com/openai/openai-agents-python/tree/main/examples/realtime/app/server.py) の Web デモ例は、この方法で `input_image` メッセージを転送します。
+
+### 音声入力
+
+raw 音声バイトをストリーミングするには [`session.send_audio()`][agents.realtime.session.RealtimeSession.send_audio] を使用します。
+
+```python
+await session.send_audio(audio_bytes)
+```
+
+サーバーサイドのターン検出が無効になっている場合は、ターン境界を示す責任があります。高レベルの便利な方法は次のとおりです。
+
+```python
+await session.send_audio(audio_bytes, commit=True)
+```
+
+より低レベルの制御が必要な場合は、基盤となるモデル トランスポートを通じて `input_audio_buffer.commit` などの raw クライアントイベントを送信することもできます。
+
+### 手動レスポンス制御
+
+`session.send_message()` は高レベルのパスを使ってユーザー入力を送信し、レスポンスを開始します。raw 音声バッファリングは、すべての設定で **自動的に** 同じことを行うわけではありません。
+
+Realtime API レベルでは、手動ターン制御とは raw `session.update` で `turn_detection` をクリアし、その後 `input_audio_buffer.commit` と `response.create` を自分で送信することを意味します。
+
+ターンを手動で管理している場合は、モデル トランスポートを通じて raw クライアントイベントを送信できます。
+
+```python
+from agents.realtime.model_inputs import RealtimeModelSendRawMessage
+
+await session.model.send_event(
+    RealtimeModelSendRawMessage(
+        message={
+            "type": "response.create",
+        }
+    )
+)
+```
+
+このパターンは次の場合に便利です。
+
+-   `turn_detection` が無効で、モデルがいつ応答すべきかを自分で決めたい場合
+-   レスポンスをトリガーする前にユーザー入力を検査またはゲートしたい場合
+-   アウトオブバンドレスポンス用にカスタムプロンプトが必要な場合
+
+[`examples/realtime/twilio_sip/server.py`](https://github.com/openai/openai-agents-python/tree/main/examples/realtime/twilio_sip/server.py) の SIP 例では、開始時のあいさつを強制するために raw `response.create` を使用しています。
+
+## イベント、履歴、割り込み
+
+`RealtimeSession` は、必要に応じて raw モデルイベントも転送しながら、より高レベルの SDK イベントを発行します。
+
+価値の高いセッションイベントには次のものがあります。
+
+-   `audio`, `audio_end`, `audio_interrupted`
+-   `agent_start`, `agent_end`
+-   `tool_start`, `tool_end`, `tool_approval_required`
+-   `handoff`
+-   `history_added`, `history_updated`
+-   `guardrail_tripped`
+-   `input_audio_timeout_triggered`
+-   `error`
+-   `raw_model_event`
+
+UI 状態に最も役立つイベントは通常、`history_added` と `history_updated` です。これらは、ユーザーメッセージ、アシスタントメッセージ、ツール呼び出しを含む `RealtimeItem` オブジェクトとして、セッションのローカル履歴を公開します。
+
+### 割り込みと再生トラッキング
+
+ユーザーがアシスタントに割り込むと、セッションは `audio_interrupted` を発行し、サーバーサイドの会話がユーザーが実際に聞いた内容と一致するように履歴を更新します。
+
+低レイテンシのローカル再生では、デフォルトの再生トラッカーで十分なことが多いです。リモート再生や遅延再生のシナリオ、特に電話では、生成された音声がすべてすでに聞かれたと仮定するのではなく、実際の再生進行に基づいて割り込み時の切り詰めが行われるように [`RealtimePlaybackTracker`][agents.realtime.model.RealtimePlaybackTracker] を使用してください。
+
+[`examples/realtime/twilio/twilio_handler.py`](https://github.com/openai/openai-agents-python/tree/main/examples/realtime/twilio/twilio_handler.py) の Twilio 例は、このパターンを示しています。
+
+## ツール、承認、ハンドオフ、ガードレール
+
+### 関数ツール
+
+リアルタイムエージェントは、ライブ会話中に関数ツールをサポートします。
 
 ```python
 from agents import function_tool
 
+
 @function_tool
 def get_weather(city: str) -> str:
     """Get current weather for a city."""
-    # Your weather API logic here
-    return f"The weather in {city} is sunny, 72°F"
+    return f"The weather in {city} is sunny, 72F."
 
-@function_tool
-def book_appointment(date: str, time: str, service: str) -> str:
-    """Book an appointment."""
-    # Your booking logic here
-    return f"Appointment booked for {service} on {date} at {time}"
 
 agent = RealtimeAgent(
     name="Assistant",
-    instructions="You can help with weather and appointments.",
-    tools=[get_weather, book_appointment],
+    instructions="You can answer weather questions.",
+    tools=[get_weather],
 )
 ```
 
-## ハンドオフ
+### ツール承認
 
-### ハンドオフの作成
-
-ハンドオフにより、専門化されたエージェント間で会話を転送できます。
+関数ツールは、実行前に人間の承認を必要とする場合があります。その場合、セッションは `tool_approval_required` を発行し、`approve_tool_call()` または `reject_tool_call()` を呼び出すまでツール実行を一時停止します。
 
 ```python
-from agents.realtime import realtime_handoff
+async for event in session:
+    if event.type == "tool_approval_required":
+        await session.approve_tool_call(event.call_id)
+```
 
-# Specialized agents
+具体的なサーバーサイドの承認ループについては、[`examples/realtime/app/server.py`](https://github.com/openai/openai-agents-python/tree/main/examples/realtime/app/server.py) を参照してください。Human-in-the-loop のドキュメントも、[Human in the loop](../human_in_the_loop.md) でこのフローを参照しています。
+
+### ハンドオフ
+
+リアルタイムハンドオフにより、あるエージェントがライブ会話を別の専門エージェントに転送できます。
+
+```python
+from agents.realtime import RealtimeAgent, realtime_handoff
+
 billing_agent = RealtimeAgent(
     name="Billing Support",
-    instructions="You specialize in billing and payment issues.",
+    instructions="You specialize in billing issues.",
 )
 
-technical_agent = RealtimeAgent(
-    name="Technical Support",
-    instructions="You handle technical troubleshooting.",
-)
-
-# Main agent with handoffs
 main_agent = RealtimeAgent(
     name="Customer Service",
-    instructions="You are the main customer service agent. Hand off to specialists when needed.",
-    handoffs=[
-        realtime_handoff(billing_agent, tool_description="Transfer to billing support"),
-        realtime_handoff(technical_agent, tool_description="Transfer to technical support"),
-    ]
+    instructions="Triage the request and hand off when needed.",
+    handoffs=[realtime_handoff(billing_agent, tool_description="Transfer to billing support")],
 )
 ```
 
-## 実行時挙動とセッション処理
-
-### イベント処理
-
-セッションはイベントをストリーミングし、セッションオブジェクトを反復することでそれらを受け取れます。イベントには、音声出力チャンク、文字起こし結果、ツール実行の開始と終了、エージェントのハンドオフ、エラーが含まれます。処理すべき主要イベントは次のとおりです。
-
--   **audio**: エージェント応答からの raw 音声データ
--   **audio_end**: エージェントの発話が終了
--   **audio_interrupted**: ユーザーがエージェントを割り込み
--   **tool_start/tool_end**: ツール実行ライフサイクル
--   **handoff**: エージェントのハンドオフが発生
--   **error**: 処理中にエラーが発生
-
-イベントの詳細については、[`RealtimeSessionEvent`][agents.realtime.events.RealtimeSessionEvent] を参照してください。
+素の `RealtimeAgent` ハンドオフは自動的にラップされ、`realtime_handoff(...)` を使うと名前、説明、検証、コールバック、可用性をカスタマイズできます。リアルタイムハンドオフは、通常のハンドオフ `input_filter` をサポートして **いません**。
 
 ### ガードレール
 
-realtime エージェントでは、出力ガードレールのみがサポートされます。これらのガードレールはデバウンスされ、リアルタイム生成中のパフォーマンス問題を避けるために、（毎単語ではなく）定期的に実行されます。既定のデバウンス長は 100 文字ですが、設定可能です。
-
-ガードレールは `RealtimeAgent` に直接アタッチするか、セッションの `run_config` 経由で提供できます。両方のソースからのガードレールはまとめて実行されます。
+リアルタイムエージェントでは出力ガードレールのみがサポートされています。これらは部分トークンごとではなく、デバウンスされたトランスクリプト蓄積に対して実行され、例外を発生させる代わりに `guardrail_tripped` を発行します。
 
 ```python
 from agents.guardrail import GuardrailFunctionOutput, OutputGuardrail
+
 
 def sensitive_data_check(context, agent, output):
     return GuardrailFunctionOutput(
         tripwire_triggered="password" in output,
         output_info=None,
     )
+
 
 agent = RealtimeAgent(
     name="Assistant",
@@ -164,69 +265,83 @@ agent = RealtimeAgent(
 )
 ```
 
-ガードレールがトリガーされると、`guardrail_tripped` イベントが生成され、エージェントの現在の応答を中断できます。デバウンス挙動は、安全性とリアルタイム性能要件のバランスに役立ちます。テキストエージェントとは異なり、realtime エージェントではガードレールがトリップしても Exception を **発生させません**。
+リアルタイム出力ガードレールが作動すると、セッションはアクティブなレスポンスに割り込み、
+`response.cancel` を強制し、`guardrail_tripped` を発行し、トリガーされたガードレールの名前を含むフォローアップのユーザーメッセージを送信して、モデルが代替レスポンスを生成できるようにします。音声プレーヤーは引き続き
+`audio_interrupted` をリッスンし、ローカル再生をただちに停止する必要があります。これは、ガードレールがデバウンスされたトランスクリプトテキストに対して実行され、トリップワイヤーが発火した時点で一部の音声がすでにバッファリングされている可能性があるためです。
 
-### 音声処理
+## SIP と電話
 
-音声は [`session.send_audio(audio_bytes)`][agents.realtime.session.RealtimeSession.send_audio] を使用してセッションに送信するか、テキストは [`session.send_message()`][agents.realtime.session.RealtimeSession.send_message] を使用して送信します。
+Python SDK には、[`OpenAIRealtimeSIPModel`][agents.realtime.openai_realtime.OpenAIRealtimeSIPModel] によるファーストクラスの SIP アタッチフローが含まれています。
 
-音声出力については、`audio` イベントを購読し、好みの音声ライブラリで音声データを再生します。ユーザーがエージェントを割り込んだ場合に即座に再生を停止し、キューに入った音声をクリアするために、`audio_interrupted` イベントを必ず購読してください。
-
-## 高度な統合と低レベルアクセス
-
-### SIP 統合
-
-[Realtime Calls API](https://platform.openai.com/docs/guides/realtime-sip) 経由で着信する電話に、realtime エージェントを接続できます。SDK は [`OpenAIRealtimeSIPModel`][agents.realtime.openai_realtime.OpenAIRealtimeSIPModel] を提供しており、SIP 上でメディアをネゴシエートしつつ同じエージェントフローを再利用します。
-
-使用するには、runner にモデルインスタンスを渡し、セッション開始時に SIP の `call_id` を指定します。call ID は、着信を通知する webhook によって配信されます。
+Realtime Calls API 経由で通話が到着し、結果として得られる `call_id` にエージェントセッションをアタッチしたい場合に使用します。
 
 ```python
-from agents.realtime import RealtimeAgent, RealtimeRunner
+from agents.realtime import RealtimeRunner
 from agents.realtime.openai_realtime import OpenAIRealtimeSIPModel
 
-runner = RealtimeRunner(
-    starting_agent=agent,
-    model=OpenAIRealtimeSIPModel(),
-)
+runner = RealtimeRunner(starting_agent=agent, model=OpenAIRealtimeSIPModel())
 
 async with await runner.run(
     model_config={
         "call_id": call_id_from_webhook,
-        "initial_model_settings": {
-            "turn_detection": {"type": "semantic_vad", "interrupt_response": True},
-        },
-    },
+    }
 ) as session:
     async for event in session:
         ...
 ```
 
-発信者が通話を終了すると SIP セッションが終了し、realtime 接続は自動的にクローズされます。完全な電話連携の例は、[`examples/realtime/twilio_sip`](https://github.com/openai/openai-agents-python/tree/main/examples/realtime/twilio_sip) を参照してください。
+最初に通話を受け入れる必要があり、受け入れペイロードをエージェント由来のセッション設定と一致させたい場合は、`OpenAIRealtimeSIPModel.build_initial_session_payload(...)` を使用してください。完全なフローは [`examples/realtime/twilio_sip/server.py`](https://github.com/openai/openai-agents-python/tree/main/examples/realtime/twilio_sip/server.py) に示されています。
 
-### モデルへの直接アクセス
+## 低レベルアクセスとカスタムエンドポイント
 
-基盤となるモデルにアクセスして、カスタムリスナーを追加したり、高度な操作を実行したりできます。
+`session.model` を通じて基盤となるトランスポートオブジェクトにアクセスできます。
+
+これは次の場合に使用します。
+
+-   `session.model.add_listener(...)` によるカスタムリスナー
+-   `response.create` や `session.update` などの raw クライアントイベント
+-   `model_config` を通じたカスタム `url`、`headers`、または `api_key` の処理
+-   既存のリアルタイム通話への `call_id` アタッチ
+
+`RealtimeModelConfig` は次をサポートします。
+
+-   `api_key`
+-   `url`
+-   `headers`
+-   `initial_model_settings`
+-   `playback_tracker`
+-   `call_id`
+
+このリポジトリに同梱されている `call_id` 例は SIP です。より広範な Realtime API でも、一部のサーバーサイド制御フローで `call_id` を使用しますが、それらはここでは Python 例としてパッケージ化されていません。
+
+Azure OpenAI に接続する場合は、GA Realtime エンドポイント URL と明示的なヘッダーを渡します。例:
 
 ```python
-# Add a custom listener to the model
-session.model.add_listener(my_custom_listener)
+session = await runner.run(
+    model_config={
+        "url": "wss://<your-resource>.openai.azure.com/openai/v1/realtime?model=<deployment-name>",
+        "headers": {"api-key": "<your-azure-api-key>"},
+    }
+)
 ```
 
-これにより、接続をより低レベルで制御する必要がある高度なユースケース向けに、[`RealtimeModel`][agents.realtime.model.RealtimeModel] インターフェースへ直接アクセスできます。
-
-### 例と追加資料
-
-完全に動作する例については、UI コンポーネントの有無を含むデモが入った [examples/realtime ディレクトリ](https://github.com/openai/openai-agents-python/tree/main/examples/realtime) を確認してください。
-
-### Azure OpenAI エンドポイント形式
-
-Azure OpenAI に接続する場合は、GA Realtime のエンドポイント形式を使用し、`model_config` の `headers` 経由で資格情報を渡します。
+トークンベース認証では、`headers` に bearer トークンを使用します。
 
 ```python
-model_config = {
-    "url": "wss://<your-resource>.openai.azure.com/openai/v1/realtime?model=<deployment-name>",
-    "headers": {"api-key": "<your-azure-api-key>"},
-}
+session = await runner.run(
+    model_config={
+        "url": "wss://<your-resource>.openai.azure.com/openai/v1/realtime?model=<deployment-name>",
+        "headers": {"authorization": f"Bearer {token}"},
+    }
+)
 ```
 
-トークンベース認証の場合は、`headers` に `{"authorization": f"Bearer {token}"}` を使用してください。
+`headers` を渡した場合、SDK は `Authorization` を自動的に追加しません。リアルタイムエージェントでは、レガシーのベータパス (`/openai/realtime?api-version=...`) を避けてください。
+
+## 関連資料
+
+-   [リアルタイムトランスポート](transport.md)
+-   [クイックスタート](quickstart.md)
+-   [OpenAI Realtime 会話](https://developers.openai.com/api/docs/guides/realtime-conversations/)
+-   [OpenAI Realtime サーバーサイド制御](https://developers.openai.com/api/docs/guides/realtime-server-controls/)
+-   [`examples/realtime`](https://github.com/openai/openai-agents-python/tree/main/examples/realtime)

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import tempfile
-import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -10,13 +10,20 @@ pytest.importorskip("cryptography")  # Skip tests if cryptography is not install
 
 from cryptography.fernet import Fernet
 
-from agents import Agent, Runner, SQLiteSession, TResponseInputItem
+from agents import Agent, Runner, SessionSettings, SQLiteSession, TResponseInputItem
 from agents.extensions.memory.encrypt_session import EncryptedSession
 from tests.fake_model import FakeModel
 from tests.test_responses import get_text_message
 
 # Mark all tests in this file as asyncio
 pytestmark = pytest.mark.asyncio
+
+
+def _invalid_encrypted_envelope() -> TResponseInputItem:
+    return cast(
+        TResponseInputItem,
+        {"__enc__": 1, "v": 1, "kid": "hkdf-v1", "payload": "not-a-valid-token"},
+    )
 
 
 @pytest.fixture
@@ -29,6 +36,19 @@ def agent() -> Agent:
 def encryption_key() -> str:
     """Fixture for a valid Fernet encryption key."""
     return str(Fernet.generate_key().decode("utf-8"))
+
+
+@pytest.fixture
+def set_fernet_time(monkeypatch):
+    """Freeze Fernet TTL checks so expiration tests avoid real waiting."""
+    current_time = 1_000
+
+    def _set_time(value: int) -> None:
+        nonlocal current_time
+        current_time = value
+
+    monkeypatch.setattr("cryptography.fernet.time.time", lambda: current_time)
+    return _set_time
 
 
 @pytest.fixture
@@ -142,9 +162,10 @@ async def test_encrypted_session_clear(encryption_key: str, underlying_session: 
 
 
 async def test_encrypted_session_ttl_expiration(
-    encryption_key: str, underlying_session: SQLiteSession
+    encryption_key: str, underlying_session: SQLiteSession, set_fernet_time
 ):
     """Test TTL expiration - expired items are silently skipped."""
+    set_fernet_time(1_000)
     session = EncryptedSession(
         session_id="test_session",
         underlying_session=underlying_session,
@@ -158,7 +179,7 @@ async def test_encrypted_session_ttl_expiration(
     ]
     await session.add_items(items)
 
-    time.sleep(2)
+    set_fernet_time(1_002)
 
     retrieved = await session.get_items()
     assert len(retrieved) == 0
@@ -170,9 +191,10 @@ async def test_encrypted_session_ttl_expiration(
 
 
 async def test_encrypted_session_pop_expired(
-    encryption_key: str, underlying_session: SQLiteSession
+    encryption_key: str, underlying_session: SQLiteSession, set_fernet_time
 ):
     """Test pop_item with expired data."""
+    set_fernet_time(1_000)
     session = EncryptedSession(
         session_id="test_session",
         underlying_session=underlying_session,
@@ -181,7 +203,7 @@ async def test_encrypted_session_pop_expired(
     )
 
     await session.add_items([{"role": "user", "content": "Test"}])
-    time.sleep(2)
+    set_fernet_time(1_002)
 
     popped = await session.pop_item()
     assert popped is None
@@ -190,9 +212,10 @@ async def test_encrypted_session_pop_expired(
 
 
 async def test_encrypted_session_pop_mixed_expired_valid(
-    encryption_key: str, underlying_session: SQLiteSession
+    encryption_key: str, underlying_session: SQLiteSession, set_fernet_time
 ):
     """Test pop_item auto-retry with mixed expired and valid items."""
+    set_fernet_time(1_000)
     session = EncryptedSession(
         session_id="test_session",
         underlying_session=underlying_session,
@@ -207,7 +230,7 @@ async def test_encrypted_session_pop_mixed_expired_valid(
         ]
     )
 
-    time.sleep(3)
+    set_fernet_time(1_003)
 
     await session.add_items(
         [
@@ -265,6 +288,79 @@ async def test_encrypted_session_get_items_limit(
     assert len(limited) == 2
     assert limited[0].get("content") == "Message 3"  # Latest 2
     assert limited[1].get("content") == "Message 4"
+
+    underlying_session.close()
+
+
+async def test_encrypted_session_get_items_limit_skips_invalid_latest_envelope(
+    encryption_key: str, underlying_session: SQLiteSession
+):
+    """Test that limit counts valid decrypted items, not encrypted envelopes."""
+    session = EncryptedSession(
+        session_id="test_session",
+        underlying_session=underlying_session,
+        encryption_key=encryption_key,
+    )
+
+    await session.add_items([{"role": "user", "content": "older valid"}])
+    await underlying_session.add_items([_invalid_encrypted_envelope()])
+
+    all_items = await session.get_items()
+    assert [item.get("content") for item in all_items] == ["older valid"]
+
+    limited = await session.get_items(limit=1)
+    assert [item.get("content") for item in limited] == ["older valid"]
+
+    underlying_session.close()
+
+
+async def test_encrypted_session_get_items_limit_returns_latest_valid_items_after_invalids(
+    encryption_key: str, underlying_session: SQLiteSession
+):
+    """Test that invalid envelopes do not hide earlier valid items from limit."""
+    session = EncryptedSession(
+        session_id="test_session",
+        underlying_session=underlying_session,
+        encryption_key=encryption_key,
+    )
+
+    await session.add_items(
+        [
+            {"role": "user", "content": "valid 0"},
+            {"role": "assistant", "content": "valid 1"},
+        ]
+    )
+    await underlying_session.add_items([_invalid_encrypted_envelope()])
+    await session.add_items([{"role": "user", "content": "valid 2"}])
+
+    limited = await session.get_items(limit=2)
+    assert [item.get("content") for item in limited] == ["valid 1", "valid 2"]
+
+    underlying_session.close()
+
+
+async def test_encrypted_session_get_items_session_settings_limit_skips_invalid_envelopes(
+    encryption_key: str, underlying_session: SQLiteSession
+):
+    """Test that session settings limit counts valid decrypted items."""
+    underlying_session.session_settings = SessionSettings(limit=3)
+    session = EncryptedSession(
+        session_id="test_session",
+        underlying_session=underlying_session,
+        encryption_key=encryption_key,
+    )
+
+    await session.add_items(
+        [
+            {"role": "user", "content": "valid 0"},
+            {"role": "assistant", "content": "valid 1"},
+            {"role": "user", "content": "valid 2"},
+        ]
+    )
+    await underlying_session.add_items([_invalid_encrypted_envelope()])
+
+    items = await session.get_items()
+    assert [item.get("content") for item in items] == ["valid 0", "valid 1", "valid 2"]
 
     underlying_session.close()
 

@@ -40,6 +40,8 @@ agent = Agent(
         # If None, MCP tool failures are raised as exceptions instead of
         # returning model-visible error text.
         "failure_error_function": None,
+        # Prefix local MCP tool names with their server name.
+        "include_server_in_tool_names": True,
     },
 )
 ```
@@ -50,6 +52,7 @@ Notes:
 - `failure_error_function` controls how MCP tool call failures are surfaced to the model.
 - When `failure_error_function` is unset, the SDK uses the default tool error formatter.
 - Server-level `failure_error_function` overrides `Agent.mcp_config["failure_error_function"]` for that server.
+- `include_server_in_tool_names` is opt-in. When enabled, each local MCP tool is exposed to the model with a deterministic server-prefixed name, which helps avoid collisions when multiple MCP servers publish tools with the same name. Generated names are ASCII-safe, stay within the function-tool name length limit, and avoid existing local function tool and enabled handoff names on the same agent. The SDK still invokes the original MCP tool name on the original server.
 
 ## Shared patterns across transports
 
@@ -101,6 +104,8 @@ asyncio.run(main())
 ```
 
 The hosted server exposes its tools automatically; you do not add it to `mcp_servers`.
+
+If you want hosted tool search to load a hosted MCP server lazily, set `tool_config["defer_loading"] = True` and add [`ToolSearchTool`][agents.tool.ToolSearchTool] to the agent. This is supported only on OpenAI Responses models. See [Tools](tools.md#hosted-tool-search) for the complete tool-search setup and constraints.
 
 ### Streaming hosted MCP results
 
@@ -339,6 +344,7 @@ async with MCPServerStdio(
 ## 5. MCP server manager
 
 When you have multiple MCP servers, use `MCPServerManager` to connect them up front and expose the connected subset to your agents.
+See the [MCPServerManager API reference](ref/mcp/manager.md) for constructor options and reconnect behavior.
 
 ```python
 from agents import Agent, Runner
